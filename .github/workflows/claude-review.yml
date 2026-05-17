@@ -1,0 +1,52 @@
+name: Claude AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    # 対象ブランチを限定したい場合は branches を指定する
+    # branches: [main, develop]
+
+# PR にコメント・レビューを書き込むので、書き込み権限が必要
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    name: Claude Review
+    runs-on: ubuntu-latest
+    # [skip-review] を含む PR タイトル / 本文ではスキップ
+    if: "!contains(github.event.pull_request.title, '[skip-review]')"
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          # diff 計算のために full history を取得
+          fetch-depth: 0
+          # PR の HEAD コミットをチェックアウト
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install anthropic==0.* requests
+
+      - name: Run Claude review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # 使用する Claude モデル。必要に応じて変更
+          CLAUDE_MODEL: "claude-sonnet-4-6"
+          # diff の最大送信サイズ(文字数)。これを超える PR は分割される
+          MAX_DIFF_CHARS: "120000"
+        run: python .github/scripts/claude_review.py
