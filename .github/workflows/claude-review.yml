@@ -1,4 +1,4 @@
-name: Claude AI Code Review
+name: Gemini AI Code Review
 
 on:
   pull_request:
@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   review:
-    name: Claude Review
+    name: Gemini Review
     runs-on: ubuntu-latest
     # [skip-review] を含む PR タイトル / 本文ではスキップ
     if: "!contains(github.event.pull_request.title, '[skip-review]')"
@@ -35,18 +35,41 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install anthropic==0.* requests
+          pip install google-genai requests
 
-      - name: Run Claude review
+      - name: Run Gemini review
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          # 使用する Claude モデル。必要に応じて変更
-          CLAUDE_MODEL: "claude-sonnet-4-6"
+          # 使用する Gemini モデル。必要に応じて変更
+          # 例: gemini-2.5-pro, gemini-2.5-flash, gemini-2.0-flash
+          GEMINI_MODEL: "gemini-2.5-pro"
           # diff の最大送信サイズ(文字数)。これを超える PR は分割される
           MAX_DIFF_CHARS: "120000"
-        run: python .github/scripts/claude_review.py
+        run: python .github/scripts/gemini_review.py
+
+      # ----------------------------------------------------------------
+      # 後で Claude (Anthropic) に戻したい場合は、上の "Install dependencies"
+      # と "Run Gemini review" を下記に差し替える(claude_review.py は残してある):
+      #
+      # - name: Install dependencies
+      #   run: |
+      #     python -m pip install --upgrade pip
+      #     pip install anthropic==0.* requests
+      #
+      # - name: Run Claude review
+      #   env:
+      #     ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #     GITHUB_REPOSITORY: ${{ github.repository }}
+      #     PR_NUMBER: ${{ github.event.pull_request.number }}
+      #     BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      #     HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      #     CLAUDE_MODEL: "claude-sonnet-4-6"
+      #     MAX_DIFF_CHARS: "120000"
+      #   run: python .github/scripts/claude_review.py
+      # ----------------------------------------------------------------
