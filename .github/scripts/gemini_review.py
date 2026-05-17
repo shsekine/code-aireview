@@ -65,6 +65,10 @@ SKIP_PATH_FRAGMENTS = (
 
 GITHUB_API = "https://api.github.com"
 
+# 我々が投稿した review を識別するためのマーカー文字列。
+# 過去 review の検出(増分レビュー用)に使う。
+REVIEW_MARKER = "## Gemini AI Code Review"
+
 
 # ---- データ構造 ---------------------------------------------------------
 
@@ -120,16 +124,69 @@ def fetch_pr_meta(repo: str, pr_number: int, token: str) -> dict[str, Any]:
 def get_unified_diff(base_sha: str, head_sha: str) -> str:
     """base..head の unified diff を取得。リネーム検出 + 3 行コンテキスト。"""
     # base コミットが浅い checkout のせいで無い可能性に備え、必要なら fetch する
-    fetch = subprocess.run(
-        ["git", "cat-file", "-e", base_sha],
+    _ensure_commit_available(base_sha)
+    return run(["git", "diff", "--unified=3", "--no-color", "-M", base_sha, head_sha])
+
+
+def _ensure_commit_available(sha: str) -> bool:
+    """指定 SHA がローカルにあることを保証する。無ければ fetch を試みる。
+
+    Returns:
+        ローカルで参照可能なら True、fetch しても取れなければ False。
+    """
+    check = subprocess.run(
+        ["git", "cat-file", "-e", sha],
         capture_output=True, text=True
     )
-    if fetch.returncode != 0:
-        # 念のため fetch
-        subprocess.run(["git", "fetch", "--no-tags", "--depth=200", "origin", base_sha],
-                       capture_output=True, text=True)
+    if check.returncode == 0:
+        return True
+    # 念のため fetch
+    subprocess.run(
+        ["git", "fetch", "--no-tags", "--depth=200", "origin", sha],
+        capture_output=True, text=True,
+    )
+    re_check = subprocess.run(
+        ["git", "cat-file", "-e", sha],
+        capture_output=True, text=True
+    )
+    return re_check.returncode == 0
 
-    return run(["git", "diff", "--unified=3", "--no-color", "-M", base_sha, head_sha])
+
+def find_last_reviewed_sha(repo: str, pr_number: int, token: str) -> str | None:
+    """この PR で我々が最後にレビューした head_sha を返す。無ければ None。
+
+    GitHub の Pull Request Reviews API から github-actions[bot] が投稿し、
+    本文に REVIEW_MARKER を含む review を探し、最新のものの commit_id を返す。
+    """
+    url = f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}/reviews"
+    # ページング(最大 100 件 × 数ページ)。通常はそれ以上 review は溜まらない。
+    ours: list[dict[str, Any]] = []
+    page = 1
+    while page <= 5:
+        r = requests.get(
+            url,
+            headers=gh_headers(token),
+            params={"per_page": 100, "page": page},
+            timeout=30,
+        )
+        r.raise_for_status()
+        batch = r.json() or []
+        if not batch:
+            break
+        for rev in batch:
+            user = (rev.get("user") or {}).get("login", "")
+            body = rev.get("body") or ""
+            if user == "github-actions[bot]" and REVIEW_MARKER in body:
+                ours.append(rev)
+        if len(batch) < 100:
+            break
+        page += 1
+
+    if not ours:
+        return None
+    # submitted_at の降順で最新のものを採用
+    ours.sort(key=lambda rev: rev.get("submitted_at") or "", reverse=True)
+    return ours[0].get("commit_id")
 
 
 # ---- Diff 解析 ----------------------------------------------------------
@@ -423,9 +480,29 @@ def main() -> int:
     pr_title = pr.get("title", "")
     pr_body = pr.get("body", "") or ""
 
-    diff_text = get_unified_diff(base_sha, head_sha)
+    # 過去に投稿した review があれば、その時点の head_sha から今回の head_sha
+    # までの差分だけをレビュー対象にする(=増分レビュー)。これにより同じ行への
+    # 重複コメントが構造的に発生しない。
+    last_sha = find_last_reviewed_sha(repo, pr_number, token)
+    review_base = base_sha
+    review_mode = "full"
+    if last_sha and last_sha != head_sha and _ensure_commit_available(last_sha):
+        review_base = last_sha
+        review_mode = "incremental"
+        print(
+            f"[gemini-review] incremental review: "
+            f"{last_sha[:7]}..{head_sha[:7]} (previous review found)"
+        )
+    elif last_sha and not _ensure_commit_available(last_sha):
+        # force push 等で過去 SHA が消えている場合は full レビューに fallback
+        print(
+            f"[gemini-review] last reviewed sha {last_sha[:7]} not in history "
+            f"(force-push?), falling back to full review"
+        )
+
+    diff_text = get_unified_diff(review_base, head_sha)
     if not diff_text.strip():
-        print("[gemini-review] empty diff, nothing to review")
+        print(f"[gemini-review] empty diff ({review_mode}), nothing to review")
         return 0
 
     all_files = parse_unified_diff(diff_text)
@@ -468,10 +545,16 @@ def main() -> int:
     raw_comments = parsed.get("comments") or []
     valid_comments = validate_comments(raw_comments, target_files)
 
-    header = "## Gemini AI Code Review\n\n"
+    header = f"{REVIEW_MARKER}\n\n"
+    range_label = (
+        f"{review_base[:7]}..{head_sha[:7]} (incremental)"
+        if review_mode == "incremental"
+        else f"{review_base[:7]}..{head_sha[:7]} (full)"
+    )
     footer = (
         f"\n\n---\n"
-        f"_model: `{model}` · inline comments: {len(valid_comments)} / "
+        f"_model: `{model}` · range: `{range_label}` · "
+        f"inline comments: {len(valid_comments)} / "
         f"{len(raw_comments)} (others were outside diff)_"
     )
     body = header + overall + footer
