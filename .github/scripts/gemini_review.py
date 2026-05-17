@@ -65,6 +65,10 @@ SKIP_PATH_FRAGMENTS = (
 
 GITHUB_API = "https://api.github.com"
 
+# 我々が投稿した review を識別するためのマーカー文字列。
+# 過去 review の検出(増分レビュー用)に使う。
+REVIEW_MARKER = "## Gemini AI Code Review"
+
 
 # ---- データ構造 ---------------------------------------------------------
 
@@ -120,16 +124,69 @@ def fetch_pr_meta(repo: str, pr_number: int, token: str) -> dict[str, Any]:
 def get_unified_diff(base_sha: str, head_sha: str) -> str:
     """base..head の unified diff を取得。リネーム検出 + 3 行コンテキスト。"""
     # base コミットが浅い checkout のせいで無い可能性に備え、必要なら fetch する
-    fetch = subprocess.run(
-        ["git", "cat-file", "-e", base_sha],
+    _ensure_commit_available(base_sha)
+    return run(["git", "diff", "--unified=3", "--no-color", "-M", base_sha, head_sha])
+
+
+def _ensure_commit_available(sha: str) -> bool:
+    """指定 SHA がローカルにあることを保証する。無ければ fetch を試みる。
+
+    Returns:
+        ローカルで参照可能なら True、fetch しても取れなければ False。
+    """
+    check = subprocess.run(
+        ["git", "cat-file", "-e", sha],
         capture_output=True, text=True
     )
-    if fetch.returncode != 0:
-        # 念のため fetch
-        subprocess.run(["git", "fetch", "--no-tags", "--depth=200", "origin", base_sha],
-                       capture_output=True, text=True)
+    if check.returncode == 0:
+        return True
+    # 念のため fetch
+    subprocess.run(
+        ["git", "fetch", "--no-tags", "--depth=200", "origin", sha],
+        capture_output=True, text=True,
+    )
+    re_check = subprocess.run(
+        ["git", "cat-file", "-e", sha],
+        capture_output=True, text=True
+    )
+    return re_check.returncode == 0
 
-    return run(["git", "diff", "--unified=3", "--no-color", "-M", base_sha, head_sha])
+
+def find_last_reviewed_sha(repo: str, pr_number: int, token: str) -> str | None:
+    """この PR で我々が最後にレビューした head_sha を返す。無ければ None。
+
+    GitHub の Pull Request Reviews API から github-actions[bot] が投稿し、
+    本文に REVIEW_MARKER を含む review を探し、最新のものの commit_id を返す。
+    """
+    url = f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}/reviews"
+    # ページング(最大 100 件 × 数ページ)。通常はそれ以上 review は溜まらない。
+    ours: list[dict[str, Any]] = []
+    page = 1
+    while page <= 5:
+        r = requests.get(
+            url,
+            headers=gh_headers(token),
+            params={"per_page": 100, "page": page},
+            timeout=30,
+        )
+        r.raise_for_status()
+        batch = r.json() or []
+        if not batch:
+            break
+        for rev in batch:
+            user = (rev.get("user") or {}).get("login", "")
+            body = rev.get("body") or ""
+            if user == "github-actions[bot]" and REVIEW_MARKER in body:
+                ours.append(rev)
+        if len(batch) < 100:
+            break
+        page += 1
+
+    if not ours:
+        return None
+    # submitted_at の降順で最新のものを採用
+    ours.sort(key=lambda rev: rev.get("submitted_at") or "", reverse=True)
+    return ours[0].get("commit_id")
 
 
 # ---- Diff 解析 ----------------------------------------------------------
@@ -235,37 +292,79 @@ def truncate_diff(diff_text: str, max_chars: int) -> str:
 
 # ---- Gemini 呼び出し ----------------------------------------------------
 
+def _supports_thinking(model: str) -> bool:
+    """このモデルが thinking_config を受け付けるか。
+
+    Gemini 2.5 系のみが thinking モデル。それ以前のモデル
+    (gemini-2.0-flash, gemini-1.5-* 等) は thinking_config 非対応で、
+    渡すと API エラーになる。
+    """
+    return "2.5" in model
+
+
 def call_gemini(model: str, system: str, user: str) -> str:
     """Gemini API を呼び出してテキストレスポンスを返す。
 
     google-genai SDK (>= 1.0) を使用。GEMINI_API_KEY を環境変数から自動取得する。
+
+    モデル別の挙動:
+    - gemini-2.5-pro / 2.5-flash: thinking モデル。思考トークンが
+      `max_output_tokens` を消費するため、`thinking_config` で思考枠を
+      別途確保する。2.5-flash は thinking_budget=0 で思考無効化も可能。
+    - gemini-2.0-flash 以前: thinking 非対応。`thinking_config` は付けない。
     """
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+    config_kwargs: dict[str, Any] = {
+        "system_instruction": system,
+        # 出力+思考の合計上限。思考モデル向けに余裕を持たせる。
+        "max_output_tokens": 16384,
+        # JSON 出力を安定させるため温度は低めに
+        "temperature": 0.2,
+    }
+
+    # thinking 対応モデルのみ thinking_budget を指定。
+    # 範囲: 2.5-pro=128-32768、2.5-flash=0-24576 (0 は思考無効)
+    thinking_cfg_cls = getattr(genai_types, "ThinkingConfig", None)
+    if _supports_thinking(model) and thinking_cfg_cls is not None:
+        config_kwargs["thinking_config"] = thinking_cfg_cls(thinking_budget=2048)
+
     response = client.models.generate_content(
         model=model,
         contents=user,
-        config=genai_types.GenerateContentConfig(
-            system_instruction=system,
-            max_output_tokens=4096,
-            # JSON 出力を安定させるため温度は低めに
-            temperature=0.2,
-            # response_mime_type を application/json にすると JSON のみ返るが、
-            # 既存プロンプトが ```json``` フェンスもサポートしているので text のまま受ける
-            response_mime_type="text/plain",
-        ),
+        config=genai_types.GenerateContentConfig(**config_kwargs),
     )
-    text = getattr(response, "text", None)
+
+    # 診断ログ: 空応答の原因(MAX_TOKENS / SAFETY 等)を特定できるように出す
+    candidates = getattr(response, "candidates", None) or []
+    finish_reasons = [str(getattr(c, "finish_reason", None)) for c in candidates]
+    usage = getattr(response, "usage_metadata", None)
+    prompt_feedback = getattr(response, "prompt_feedback", None)
+    print(
+        f"[gemini-review] response: finish_reason={finish_reasons} "
+        f"usage={usage} prompt_feedback={prompt_feedback}"
+    )
+
+    # text の取得。google-genai の .text プロパティは parts が無いと
+    # ValueError を投げることがあるので try で囲む。
+    text = ""
+    try:
+        text = response.text or ""
+    except Exception as e:  # noqa: BLE001
+        print(f"[gemini-review] response.text raised: {e}")
+
     if not text:
-        # 念のため candidates から拾う
+        # candidates の parts から手動で拾う
         parts: list[str] = []
-        for cand in getattr(response, "candidates", []) or []:
+        for cand in candidates:
             content = getattr(cand, "content", None)
             for p in getattr(content, "parts", []) or []:
                 t = getattr(p, "text", None)
                 if t:
                     parts.append(t)
         text = "".join(parts)
-    return (text or "").strip()
+
+    return text.strip()
 
 
 JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
@@ -371,7 +470,7 @@ def main() -> int:
     base_sha = env("BASE_SHA")
     head_sha = env("HEAD_SHA")
     token = env("GITHUB_TOKEN")
-    model = env("GEMINI_MODEL", required=False, default="gemini-2.5-pro")
+    model = env("GEMINI_MODEL", required=False, default="gemini-2.5-flash")
     max_chars = int(env("MAX_DIFF_CHARS", required=False, default="120000"))
     env("GEMINI_API_KEY")  # 存在チェックのみ。SDK が直接読む
 
@@ -381,9 +480,29 @@ def main() -> int:
     pr_title = pr.get("title", "")
     pr_body = pr.get("body", "") or ""
 
-    diff_text = get_unified_diff(base_sha, head_sha)
+    # 過去に投稿した review があれば、その時点の head_sha から今回の head_sha
+    # までの差分だけをレビュー対象にする(=増分レビュー)。これにより同じ行への
+    # 重複コメントが構造的に発生しない。
+    last_sha = find_last_reviewed_sha(repo, pr_number, token)
+    review_base = base_sha
+    review_mode = "full"
+    if last_sha and last_sha != head_sha and _ensure_commit_available(last_sha):
+        review_base = last_sha
+        review_mode = "incremental"
+        print(
+            f"[gemini-review] incremental review: "
+            f"{last_sha[:7]}..{head_sha[:7]} (previous review found)"
+        )
+    elif last_sha and not _ensure_commit_available(last_sha):
+        # force push 等で過去 SHA が消えている場合は full レビューに fallback
+        print(
+            f"[gemini-review] last reviewed sha {last_sha[:7]} not in history "
+            f"(force-push?), falling back to full review"
+        )
+
+    diff_text = get_unified_diff(review_base, head_sha)
     if not diff_text.strip():
-        print("[gemini-review] empty diff, nothing to review")
+        print(f"[gemini-review] empty diff ({review_mode}), nothing to review")
         return 0
 
     all_files = parse_unified_diff(diff_text)
@@ -426,10 +545,16 @@ def main() -> int:
     raw_comments = parsed.get("comments") or []
     valid_comments = validate_comments(raw_comments, target_files)
 
-    header = "## Gemini AI Code Review\n\n"
+    header = f"{REVIEW_MARKER}\n\n"
+    range_label = (
+        f"{review_base[:7]}..{head_sha[:7]} (incremental)"
+        if review_mode == "incremental"
+        else f"{review_base[:7]}..{head_sha[:7]} (full)"
+    )
     footer = (
         f"\n\n---\n"
-        f"_model: `{model}` · inline comments: {len(valid_comments)} / "
+        f"_model: `{model}` · range: `{range_label}` · "
+        f"inline comments: {len(valid_comments)} / "
         f"{len(raw_comments)} (others were outside diff)_"
     )
     body = header + overall + footer
