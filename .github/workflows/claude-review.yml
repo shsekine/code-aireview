@@ -45,9 +45,11 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          # 使用する Gemini モデル。必要に応じて変更
-          # 例: gemini-2.5-pro, gemini-2.5-flash, gemini-2.0-flash
-          GEMINI_MODEL: "gemini-2.5-pro"
+          # 使用する Gemini モデル。GEMINI_MODEL の変更だけで自由に切り替え可能。
+          # - gemini-2.5-flash : 速くて安い (デフォルト)
+          # - gemini-2.5-pro   : 高品質だが遅く、コスト高
+          # - gemini-2.0-flash : thinking 非対応の旧世代 (スクリプト側で自動判定)
+          GEMINI_MODEL: "gemini-2.5-flash"
           # diff の最大送信サイズ(文字数)。これを超える PR は分割される
           MAX_DIFF_CHARS: "120000"
         run: python .github/scripts/gemini_review.py

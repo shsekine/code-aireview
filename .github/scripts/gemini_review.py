@@ -235,37 +235,79 @@ def truncate_diff(diff_text: str, max_chars: int) -> str:
 
 # ---- Gemini 呼び出し ----------------------------------------------------
 
+def _supports_thinking(model: str) -> bool:
+    """このモデルが thinking_config を受け付けるか。
+
+    Gemini 2.5 系のみが thinking モデル。それ以前のモデル
+    (gemini-2.0-flash, gemini-1.5-* 等) は thinking_config 非対応で、
+    渡すと API エラーになる。
+    """
+    return "2.5" in model
+
+
 def call_gemini(model: str, system: str, user: str) -> str:
     """Gemini API を呼び出してテキストレスポンスを返す。
 
     google-genai SDK (>= 1.0) を使用。GEMINI_API_KEY を環境変数から自動取得する。
+
+    モデル別の挙動:
+    - gemini-2.5-pro / 2.5-flash: thinking モデル。思考トークンが
+      `max_output_tokens` を消費するため、`thinking_config` で思考枠を
+      別途確保する。2.5-flash は thinking_budget=0 で思考無効化も可能。
+    - gemini-2.0-flash 以前: thinking 非対応。`thinking_config` は付けない。
     """
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+    config_kwargs: dict[str, Any] = {
+        "system_instruction": system,
+        # 出力+思考の合計上限。思考モデル向けに余裕を持たせる。
+        "max_output_tokens": 16384,
+        # JSON 出力を安定させるため温度は低めに
+        "temperature": 0.2,
+    }
+
+    # thinking 対応モデルのみ thinking_budget を指定。
+    # 範囲: 2.5-pro=128-32768、2.5-flash=0-24576 (0 は思考無効)
+    thinking_cfg_cls = getattr(genai_types, "ThinkingConfig", None)
+    if _supports_thinking(model) and thinking_cfg_cls is not None:
+        config_kwargs["thinking_config"] = thinking_cfg_cls(thinking_budget=2048)
+
     response = client.models.generate_content(
         model=model,
         contents=user,
-        config=genai_types.GenerateContentConfig(
-            system_instruction=system,
-            max_output_tokens=4096,
-            # JSON 出力を安定させるため温度は低めに
-            temperature=0.2,
-            # response_mime_type を application/json にすると JSON のみ返るが、
-            # 既存プロンプトが ```json``` フェンスもサポートしているので text のまま受ける
-            response_mime_type="text/plain",
-        ),
+        config=genai_types.GenerateContentConfig(**config_kwargs),
     )
-    text = getattr(response, "text", None)
+
+    # 診断ログ: 空応答の原因(MAX_TOKENS / SAFETY 等)を特定できるように出す
+    candidates = getattr(response, "candidates", None) or []
+    finish_reasons = [str(getattr(c, "finish_reason", None)) for c in candidates]
+    usage = getattr(response, "usage_metadata", None)
+    prompt_feedback = getattr(response, "prompt_feedback", None)
+    print(
+        f"[gemini-review] response: finish_reason={finish_reasons} "
+        f"usage={usage} prompt_feedback={prompt_feedback}"
+    )
+
+    # text の取得。google-genai の .text プロパティは parts が無いと
+    # ValueError を投げることがあるので try で囲む。
+    text = ""
+    try:
+        text = response.text or ""
+    except Exception as e:  # noqa: BLE001
+        print(f"[gemini-review] response.text raised: {e}")
+
     if not text:
-        # 念のため candidates から拾う
+        # candidates の parts から手動で拾う
         parts: list[str] = []
-        for cand in getattr(response, "candidates", []) or []:
+        for cand in candidates:
             content = getattr(cand, "content", None)
             for p in getattr(content, "parts", []) or []:
                 t = getattr(p, "text", None)
                 if t:
                     parts.append(t)
         text = "".join(parts)
-    return (text or "").strip()
+
+    return text.strip()
 
 
 JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
@@ -371,7 +413,7 @@ def main() -> int:
     base_sha = env("BASE_SHA")
     head_sha = env("HEAD_SHA")
     token = env("GITHUB_TOKEN")
-    model = env("GEMINI_MODEL", required=False, default="gemini-2.5-pro")
+    model = env("GEMINI_MODEL", required=False, default="gemini-2.5-flash")
     max_chars = int(env("MAX_DIFF_CHARS", required=False, default="120000"))
     env("GEMINI_API_KEY")  # 存在チェックのみ。SDK が直接読む
 
